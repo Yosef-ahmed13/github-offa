@@ -1,0 +1,276 @@
+name: 🌐 Domain Collector & Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: '🔗 رابط الموقع المراد جمع الدومينات منه'
+        required: true
+        type: string
+        default: 'https://example.com'
+      timeout:
+        description: '⏱️ مهلة الفحص لكل دومين (بالثواني)'
+        required: false
+        type: number
+        default: 10
+      depth:
+        description: '📊 عمق البحث (1=صفحة واحدة, 2=صفحتين...)'
+        required: false
+        type: number
+        default: 1
+
+jobs:
+  collect-and-check-domains:
+    name: 🔍 جمع وفحص الدومينات
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 📦 Cache pip packages
+        uses: actions/cache@v4
+        id: cache-pip
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-domain-checker-v2
+          restore-keys: |
+            ${{ runner.os }}-pip-domain-checker-
+            ${{ runner.os }}-pip-
+
+      - name: 🔧 Install Dependencies
+        run: |
+          pip install requests beautifulsoup4 lxml tldextract tabulate
+
+      - name: 🕷️ Collect & Check Domains
+        id: domain_check
+        env:
+          TARGET_URL: ${{ github.event.inputs.target_url }}
+          TIMEOUT: ${{ github.event.inputs.timeout }}
+          DEPTH: ${{ github.event.inputs.depth }}
+        run: |
+          cat << 'PYEOF' > domain_checker.py
+          import requests
+          import re
+          import sys
+          import os
+          import json
+          import time
+          from urllib.parse import urlparse, urljoin
+          from bs4 import BeautifulSoup
+          import tldextract
+          from datetime import datetime
+          from tabulate import tabulate
+
+          TARGET_URL = os.environ.get("TARGET_URL", "https://example.com")
+          TIMEOUT = int(os.environ.get("TIMEOUT", 10))
+          DEPTH = int(os.environ.get("DEPTH", 1))
+
+          visited_urls = set()
+          found_domains = set()
+
+          HEADERS = {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          }
+
+          print(f"\n{'='*60}")
+          print(f"  DOMAIN COLLECTOR & CHECKER")
+          print(f"{'='*60}")
+          print(f"  Target  : {TARGET_URL}")
+          print(f"  Timeout : {TIMEOUT}s per domain")
+          print(f"  Depth   : {DEPTH} level(s)")
+          print(f"{'='*60}\n")
+
+          # ─── STEP 1: Collect Domains ───────────────────────────────
+          def extract_domains_from_page(url, current_depth=1, max_depth=DEPTH):
+              if url in visited_urls or current_depth > max_depth:
+                  return
+              visited_urls.add(url)
+              try:
+                  resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=True)
+                  soup = BeautifulSoup(resp.text, "lxml")
+
+                  for tag in soup.find_all(True):
+                      for attr in ["href", "src", "action", "data-src", "data-href", "data-url"]:
+                          link = tag.get(attr, "")
+                          if not link:
+                              continue
+                          parsed = urlparse(link)
+                          if parsed.netloc:
+                              ext = tldextract.extract(parsed.netloc)
+                              if ext.domain and ext.suffix:
+                                  found_domains.add(f"{ext.domain}.{ext.suffix}")
+                          if current_depth < max_depth:
+                              full_url = urljoin(url, link)
+                              parsed_full = urlparse(full_url)
+                              base_parsed = urlparse(TARGET_URL)
+                              if parsed_full.netloc == base_parsed.netloc:
+                                  extract_domains_from_page(full_url, current_depth + 1, max_depth)
+
+                  # Regex sweep on raw HTML
+                  domain_pattern = r'(?<![/@\w])((?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,})'
+                  for match in re.findall(domain_pattern, resp.text):
+                      ext = tldextract.extract(match)
+                      if ext.domain and ext.suffix:
+                          found_domains.add(f"{ext.domain}.{ext.suffix}")
+
+                  print(f"  [SCRAPED] {url}  —  {len(found_domains)} domains so far")
+
+              except Exception as e:
+                  print(f"  [WARN] Could not scrape {url}: {e}")
+
+          extract_domains_from_page(TARGET_URL, 1, DEPTH)
+          base_ext = tldextract.extract(TARGET_URL)
+          if base_ext.domain and base_ext.suffix:
+              found_domains.add(f"{base_ext.domain}.{base_ext.suffix}")
+
+          print(f"\n  Total unique domains found: {len(found_domains)}")
+
+          # ─── STEP 2: Check Each Domain ────────────────────────────
+          print(f"\n{'='*60}")
+          print(f"  CHECKING DOMAINS...")
+          print(f"{'='*60}\n")
+
+          working = []
+          dead = []
+
+          for domain in sorted(found_domains):
+              checked = False
+              for scheme in ["https", "http"]:
+                  try:
+                      start = time.time()
+                      r = requests.head(
+                          f"{scheme}://{domain}",
+                          headers=HEADERS,
+                          timeout=TIMEOUT,
+                          allow_redirects=True
+                      )
+                      elapsed = round(time.time() - start, 2)
+                      entry = {
+                          "domain": domain,
+                          "url": f"{scheme}://{domain}",
+                          "status_code": r.status_code,
+                          "response_time": f"{elapsed}s",
+                          "error": None
+                      }
+                      if r.status_code < 500:
+                          working.append(entry)
+                          print(f"  [OK]  {domain:<35} {r.status_code}  {elapsed}s")
+                      else:
+                          dead.append(entry)
+                          print(f"  [ERR] {domain:<35} {r.status_code}  {elapsed}s")
+                      checked = True
+                      break
+                  except requests.exceptions.SSLError:
+                      continue
+                  except Exception as e:
+                      if scheme == "http":
+                          entry = {
+                              "domain": domain,
+                              "url": f"https://{domain}",
+                              "status_code": None,
+                              "response_time": None,
+                              "error": str(e)[:80]
+                          }
+                          dead.append(entry)
+                          print(f"  [DEAD]{domain:<35} TIMEOUT/ERR")
+                          checked = True
+              if not checked:
+                  dead.append({"domain": domain, "url": f"https://{domain}", "status_code": None, "response_time": None, "error": "All schemes failed"})
+
+          # ─── STEP 3: Save & Report ────────────────────────────────
+          timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+          with open("working_domains.txt", "w", encoding="utf-8") as f:
+              f.write(f"# Working Domains — {timestamp}\n")
+              f.write(f"# Source: {TARGET_URL}\n")
+              f.write(f"# Count: {len(working)}\n\n")
+              for d in working:
+                  f.write(f"{d['domain']} | HTTP {d['status_code']} | {d['response_time']}\n")
+
+          with open("dead_domains.txt", "w", encoding="utf-8") as f:
+              f.write(f"# Dead Domains — {timestamp}\n")
+              f.write(f"# Source: {TARGET_URL}\n")
+              f.write(f"# Count: {len(dead)}\n\n")
+              for d in dead:
+                  f.write(f"{d['domain']} | {d.get('status_code','N/A')} | {d.get('error','')}\n")
+
+          with open("all_domains.json", "w", encoding="utf-8") as f:
+              json.dump({
+                  "timestamp": timestamp,
+                  "source": TARGET_URL,
+                  "depth": DEPTH,
+                  "timeout": TIMEOUT,
+                  "summary": {
+                      "total": len(found_domains),
+                      "working": len(working),
+                      "dead": len(dead)
+                  },
+                  "working_domains": working,
+                  "dead_domains": dead
+              }, f, ensure_ascii=False, indent=2)
+
+          print(f"\n{'='*60}")
+          print(f"  FINAL REPORT")
+          print(f"{'='*60}")
+          print(f"  ✅ Working : {len(working)}")
+          print(f"  ❌ Dead    : {len(dead)}")
+          print(f"  📋 Total   : {len(found_domains)}")
+          print(f"{'='*60}\n")
+
+          if working:
+              print("WORKING DOMAINS:")
+              print(tabulate(
+                  [[d["domain"], d["status_code"], d["response_time"]] for d in working],
+                  headers=["Domain", "HTTP", "Time"],
+                  tablefmt="simple"
+              ))
+
+          if dead:
+              print("\nDEAD / UNREACHABLE DOMAINS:")
+              print(tabulate(
+                  [[d["domain"], d.get("status_code","N/A"), (d.get("error") or "")[:50]] for d in dead],
+                  headers=["Domain", "HTTP", "Error"],
+                  tablefmt="simple"
+              ))
+
+          # GitHub Actions outputs
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as f:
+                  f.write(f"working_count={len(working)}\n")
+                  f.write(f"dead_count={len(dead)}\n")
+                  f.write(f"total_domains={len(found_domains)}\n")
+          PYEOF
+          python3 domain_checker.py
+
+      - name: 📤 Upload Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: domain-results-run-${{ github.run_number }}
+          path: |
+            working_domains.txt
+            dead_domains.txt
+            all_domains.json
+          retention-days: 30
+
+      - name: 📊 Job Summary
+        if: always()
+        run: |
+          echo "## 🌐 Domain Checker Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔗 Target URL | \`${{ github.event.inputs.target_url }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📊 Depth | ${{ github.event.inputs.depth }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Working Domains | **${{ steps.domain_check.outputs.working_count }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Dead Domains | **${{ steps.domain_check.outputs.dead_count }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📋 Total Found | **${{ steps.domain_check.outputs.total_domains }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> 📥 Download full results from the **Artifacts** section above" >> $GITHUB_STEP_SUMMARY
